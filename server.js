@@ -9,7 +9,7 @@ const app = express();
 
 // ==================== CONFIGURATION CORS ====================
 app.use(cors({
-    origin: ['http://localhost:5500', 'http://127.0.0.1:5500', 'http://localhost:3000', 'http://127.0.0.1:3000', 'https://ventegohbito.netlify.app'],
+    origin: '*',
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization']
@@ -54,7 +54,6 @@ async function verifyToken(req, res, next) {
 
 // ==================== ROUTES ====================
 
-// Route d'accueil
 app.get('/', (req, res) => {
     res.json({ 
         message: '🚀 Serveur GHBITO en ligne !',
@@ -62,12 +61,17 @@ app.get('/', (req, res) => {
             'GET  /api/products',
             'GET  /api/categories',
             'GET  /api/zones',
-            'POST /api/orders (stock auto-décrementé)'
+            'GET  /api/products/:id/reviews',
+            'POST /api/orders',
+            'GET  /api/orders/my',
+            'GET  /api/admin/stats',
+            'GET  /api/admin/reviews  ← NOUVEAU',
+            'DELETE /api/products/:id/reviews/:id  ← NOUVEAU'
         ]
     });
 });
 
-// 1. Récupérer tous les produits (public)
+// 1. Produits
 app.get('/api/products', async (req, res) => {
     try {
         const snapshot = await db.collection('products').orderBy('createdAt', 'desc').get();
@@ -83,12 +87,11 @@ app.get('/api/products', async (req, res) => {
         });
         res.json(products);
     } catch (error) {
-        console.error('Erreur GET /products:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 2. Récupérer toutes les catégories (public)
+// 2. Catégories
 app.get('/api/categories', async (req, res) => {
     try {
         const snapshot = await db.collection('categories').orderBy('name').get();
@@ -98,27 +101,25 @@ app.get('/api/categories', async (req, res) => {
         });
         res.json(categories);
     } catch (error) {
-        console.error('Erreur GET /categories:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 3. Récupérer toutes les zones (public)
+// 3. Zones
 app.get('/api/zones', async (req, res) => {
     try {
-        const snapshot = await db.collection('zones').orderBy('order').get();
+        const snapshot = await db.collection('zones').orderBy('order', 'asc').get();
         const zones = [];
         snapshot.forEach(doc => {
             zones.push({ id: doc.id, ...doc.data() });
         });
         res.json(zones);
     } catch (error) {
-        console.error('Erreur GET /zones:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 4. Récupérer les avis d'un produit (public)
+// 4. Avis d'un produit
 app.get('/api/products/:id/reviews', async (req, res) => {
     try {
         const snapshot = await db.collection('reviews')
@@ -127,11 +128,15 @@ app.get('/api/products/:id/reviews', async (req, res) => {
             .get();
         const reviews = [];
         snapshot.forEach(doc => {
-            reviews.push({ id: doc.id, ...doc.data() });
+            const data = doc.data();
+            reviews.push({ 
+                id: doc.id, 
+                ...data,
+                createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
+            });
         });
         res.json(reviews);
     } catch (error) {
-        console.error('Erreur GET /products/:id/reviews:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -142,7 +147,6 @@ app.post('/api/products/:id/reviews', verifyToken, async (req, res) => {
         const productId = req.params.id;
         const { rating, text } = req.body;
         
-        // Vérifier si l'utilisateur a déjà acheté et reçu le produit
         const ordersSnapshot = await db.collection('orders')
             .where('userId', '==', req.user.uid)
             .where('status', '==', 'delivered')
@@ -160,7 +164,6 @@ app.post('/api/products/:id/reviews', verifyToken, async (req, res) => {
             return res.status(403).json({ error: 'Vous devez acheter ce produit pour laisser un avis' });
         }
         
-        // Vérifier si l'utilisateur a déjà laissé un avis
         const existingReview = await db.collection('reviews')
             .where('productId', '==', productId)
             .where('userId', '==', req.user.uid)
@@ -170,11 +173,9 @@ app.post('/api/products/:id/reviews', verifyToken, async (req, res) => {
             return res.status(400).json({ error: 'Vous avez déjà laissé un avis pour ce produit' });
         }
         
-        // Récupérer les infos utilisateur
         const userDoc = await db.collection('users').doc(req.user.uid).get();
         const userName = userDoc.exists ? userDoc.data().name : req.user.email;
         
-        // Créer l'avis
         const reviewData = {
             productId,
             userId: req.user.uid,
@@ -186,15 +187,12 @@ app.post('/api/products/:id/reviews', verifyToken, async (req, res) => {
         
         await db.collection('reviews').add(reviewData);
         
-        // Mettre à jour la moyenne des notes du produit
         const allReviews = await db.collection('reviews')
             .where('productId', '==', productId)
             .get();
         
         let totalRating = 0;
-        allReviews.forEach(doc => {
-            totalRating += doc.data().rating;
-        });
+        allReviews.forEach(doc => { totalRating += doc.data().rating; });
         
         const avgRating = totalRating / allReviews.size;
         const reviewCount = allReviews.size;
@@ -206,48 +204,104 @@ app.post('/api/products/:id/reviews', verifyToken, async (req, res) => {
         
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur POST /products/:id/reviews:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ==================== ROUTES ADMIN ====================
-
-// Upload image
-app.post('/api/upload', verifyToken, upload.single('image'), async (req, res) => {
+// 6. SUPPRIMER UN AVIS (NOUVEAU - ADMIN)
+app.delete('/api/products/:productId/reviews/:reviewId', verifyToken, async (req, res) => {
     if (!req.isAdmin) {
         return res.status(403).json({ error: 'Admin requis' });
     }
     
-    if (!req.file) {
-        return res.status(400).json({ error: 'Aucune image' });
+    try {
+        const { productId, reviewId } = req.params;
+        
+        // Supprimer l'avis
+        await db.collection('reviews').doc(reviewId).delete();
+        
+        // Recalculer la moyenne du produit
+        const allReviews = await db.collection('reviews')
+            .where('productId', '==', productId)
+            .get();
+        
+        let totalRating = 0;
+        let reviewCount = 0;
+        allReviews.forEach(doc => {
+            totalRating += doc.data().rating;
+            reviewCount++;
+        });
+        
+        const avgRating = reviewCount > 0 ? totalRating / reviewCount : 0;
+        
+        await db.collection('products').doc(productId).update({
+            avgRating: avgRating,
+            reviewCount: reviewCount,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
+});
+
+// 7. TOUS LES AVIS POUR ADMIN (NOUVEAU)
+app.get('/api/admin/reviews', verifyToken, async (req, res) => {
+    if (!req.isAdmin) {
+        return res.status(403).json({ error: 'Admin requis' });
+    }
+    
+    try {
+        const snapshot = await db.collection('reviews').orderBy('createdAt', 'desc').get();
+        const reviews = [];
+        
+        for (const doc of snapshot.docs) {
+            const data = doc.data();
+            // Récupérer le nom du produit
+            const productDoc = await db.collection('products').doc(data.productId).get();
+            const productName = productDoc.exists ? productDoc.data().name : 'Produit inconnu';
+            
+            reviews.push({
+                id: doc.id,
+                productId: data.productId,
+                productName: productName,
+                userId: data.userId,
+                userName: data.userName,
+                rating: data.rating,
+                text: data.text,
+                createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
+            });
+        }
+        
+        res.json(reviews);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== ROUTES ADMIN PRODUITS ====================
+
+app.post('/api/upload', verifyToken, upload.single('image'), async (req, res) => {
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
+    if (!req.file) return res.status(400).json({ error: 'Aucune image' });
     
     try {
         const result = await new Promise((resolve, reject) => {
             const uploadStream = cloudinary.uploader.upload_stream({
                 folder: 'ghbito/products',
-                transformation: [{ width: 800, height: 800, crop: 'limit' }, { quality: 'auto', fetch_format: 'auto' }]
-            }, (error, result) => {
-                if (error) reject(error);
-                else resolve(result);
-            });
+                transformation: [{ width: 800, height: 800, crop: 'limit' }]
+            }, (error, result) => error ? reject(error) : resolve(result));
             uploadStream.end(req.file.buffer);
         });
-        
         res.json({ url: result.secure_url });
     } catch (error) {
-        console.error('Erreur upload:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Créer un produit
 app.post('/api/products', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         const stockQuantity = req.body.stockQuantity || 0;
         const productData = {
@@ -262,238 +316,153 @@ app.post('/api/products', verifyToken, async (req, res) => {
         const docRef = await db.collection('products').add(productData);
         res.json({ id: docRef.id, ...productData });
     } catch (error) {
-        console.error('Erreur POST /products:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Modifier un produit
 app.put('/api/products/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
-        const stockQuantity = req.body.stockQuantity;
-        const updateData = {
-            ...req.body,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-        
-        // Mettre à jour inStock automatiquement
-        if (stockQuantity !== undefined) {
-            updateData.inStock = stockQuantity > 0;
-        }
-        
+        const updateData = { ...req.body, updatedAt: admin.firestore.FieldValue.serverTimestamp() };
         await db.collection('products').doc(req.params.id).update(updateData);
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur PUT /products:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Supprimer un produit
 app.delete('/api/products/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
-        // Supprimer également les avis associés
-        const reviewsSnapshot = await db.collection('reviews')
-            .where('productId', '==', req.params.id)
-            .get();
-        
+        const reviewsSnapshot = await db.collection('reviews').where('productId', '==', req.params.id).get();
         const batch = db.batch();
-        reviewsSnapshot.forEach(doc => {
-            batch.delete(doc.ref);
-        });
+        reviewsSnapshot.forEach(doc => batch.delete(doc.ref));
         batch.delete(db.collection('products').doc(req.params.id));
         await batch.commit();
-        
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur DELETE /products:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Créer une catégorie
+// ==================== ROUTES ADMIN CATÉGORIES ====================
+
 app.post('/api/categories', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
-        const catData = {
-            ...req.body,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-        const docRef = await db.collection('categories').add(catData);
-        res.json({ id: docRef.id, ...catData });
+        const docRef = await db.collection('categories').add({ ...req.body, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+        res.json({ id: docRef.id, ...req.body });
     } catch (error) {
-        console.error('Erreur POST /categories:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Modifier une catégorie
 app.put('/api/categories/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         await db.collection('categories').doc(req.params.id).update(req.body);
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur PUT /categories:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Supprimer une catégorie
 app.delete('/api/categories/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         await db.collection('categories').doc(req.params.id).delete();
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur DELETE /categories:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Créer une zone
+// ==================== ROUTES ADMIN ZONES ====================
+
 app.post('/api/zones', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
-        const zoneData = {
-            ...req.body,
-            order: 0,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-        const docRef = await db.collection('zones').add(zoneData);
-        res.json({ id: docRef.id, ...zoneData });
+        const zonesSnapshot = await db.collection('zones').get();
+        const docRef = await db.collection('zones').add({ ...req.body, order: zonesSnapshot.size, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+        res.json({ id: docRef.id, ...req.body });
     } catch (error) {
-        console.error('Erreur POST /zones:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Modifier une zone
 app.put('/api/zones/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         await db.collection('zones').doc(req.params.id).update(req.body);
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur PUT /zones:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Supprimer une zone
 app.delete('/api/zones/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         await db.collection('zones').doc(req.params.id).delete();
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur DELETE /zones:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// ==================== COMMANDES AVEC DÉCRÉMENTATION STOCK ====================
+// ==================== COMMANDES ====================
 
-// Créer une commande (avec décrémentation automatique du stock)
 app.post('/api/orders', verifyToken, async (req, res) => {
     try {
         const orderItems = req.body.items || [];
         
-        // Vérification du stock pour chaque produit
         for (const item of orderItems) {
             const productDoc = await db.collection('products').doc(item.productId).get();
             if (!productDoc.exists) {
                 return res.status(400).json({ error: `Produit "${item.name}" introuvable` });
             }
-            
             const product = productDoc.data();
             const currentStock = product.stockQuantity || 0;
-            
             if (currentStock < item.qty) {
-                return res.status(400).json({ 
-                    error: `Stock insuffisant pour "${item.name}". Disponible: ${currentStock}` 
-                });
+                return res.status(400).json({ error: `Stock insuffisant pour "${item.name}". Disponible: ${currentStock}` });
             }
         }
         
-        // Firestore transaction pour la décrémentation
         const orderRef = db.collection('orders').doc();
         const orderId = orderRef.id;
         
         await db.runTransaction(async (transaction) => {
-            // Décrémenter le stock pour chaque produit
             for (const item of orderItems) {
                 const productRef = db.collection('products').doc(item.productId);
                 const productDoc = await transaction.get(productRef);
                 const product = productDoc.data();
                 const newStock = (product.stockQuantity || 0) - item.qty;
-                
                 transaction.update(productRef, {
                     stockQuantity: newStock,
                     inStock: newStock > 0,
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
-                
-                // Alerte stock bas (log)
-                if (newStock <= (product.stockAlert || 5) && newStock > 0) {
-                    console.log(`⚠️ Stock bas pour "${product.name}": ${newStock} restants`);
-                }
             }
             
-            // Créer la commande
             const orderData = {
                 id: orderId,
                 ...req.body,
                 userId: req.user.uid,
+                userEmail: req.user.email,
                 status: 'pending',
                 orderNumber: `CMD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             };
-            
             transaction.set(orderRef, orderData);
         });
         
-        // Récupérer la commande créée
         const createdOrder = await orderRef.get();
-        
-        res.json({ 
-            success: true, 
-            id: orderId,
-            ...createdOrder.data() 
-        });
+        res.json({ success: true, id: orderId, ...createdOrder.data() });
     } catch (error) {
-        console.error('Erreur POST /orders:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Mes commandes
 app.get('/api/orders/my', verifyToken, async (req, res) => {
     try {
         const snapshot = await db.collection('orders')
@@ -511,19 +480,16 @@ app.get('/api/orders/my', verifyToken, async (req, res) => {
         });
         res.json(orders);
     } catch (error) {
-        console.error('Erreur GET /orders/my:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Toutes les commandes (admin)
 app.get('/api/orders', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
-        const snapshot = await db.collection('orders').orderBy('createdAt', 'desc').get();
+        let query = db.collection('orders').orderBy('createdAt', 'desc');
+        if (req.query.limit) query = query.limit(parseInt(req.query.limit));
+        const snapshot = await query.get();
         const orders = [];
         snapshot.forEach(doc => {
             const data = doc.data();
@@ -535,35 +501,35 @@ app.get('/api/orders', verifyToken, async (req, res) => {
         });
         res.json(orders);
     } catch (error) {
-        console.error('Erreur GET /orders:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Changer statut commande (admin)
 app.patch('/api/orders/:id/status', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
-        const newStatus = req.body.status;
-        const updateData = {
-            status: newStatus,
+        await db.collection('orders').doc(req.params.id).update({
+            status: req.body.status,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
+        });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/orders/:id', verifyToken, async (req, res) => {
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
+    try {
+        const orderDoc = await db.collection('orders').doc(req.params.id).get();
+        const order = orderDoc.data();
         
-        // Si la commande est annulée, on remet le stock
-        if (newStatus === 'cancelled') {
-            const orderDoc = await db.collection('orders').doc(req.params.id).get();
-            const order = orderDoc.data();
-            
-            if (order && order.items) {
-                for (const item of order.items) {
-                    const productRef = db.collection('products').doc(item.productId);
-                    const productDoc = await productRef.get();
+        if (order && order.status !== 'delivered' && order.status !== 'cancelled') {
+            for (const item of order.items) {
+                const productRef = db.collection('products').doc(item.productId);
+                const productDoc = await productRef.get();
+                if (productDoc.exists) {
                     const currentStock = productDoc.data().stockQuantity || 0;
-                    
                     await productRef.update({
                         stockQuantity: currentStock + item.qty,
                         inStock: true,
@@ -573,142 +539,88 @@ app.patch('/api/orders/:id/status', verifyToken, async (req, res) => {
             }
         }
         
-        await db.collection('orders').doc(req.params.id).update(updateData);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Erreur PATCH /orders/status:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Supprimer commande (admin)
-app.delete('/api/orders/:id', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
-    try {
-        // Récupérer la commande pour remettre le stock si nécessaire
-        const orderDoc = await db.collection('orders').doc(req.params.id).get();
-        const order = orderDoc.data();
-        
-        if (order && order.status !== 'cancelled' && order.status !== 'delivered') {
-            for (const item of order.items) {
-                const productRef = db.collection('products').doc(item.productId);
-                const productDoc = await productRef.get();
-                const currentStock = productDoc.data().stockQuantity || 0;
-                
-                await productRef.update({
-                    stockQuantity: currentStock + item.qty,
-                    inStock: true,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-            }
-        }
-        
         await db.collection('orders').doc(req.params.id).delete();
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur DELETE /orders:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Stats admin
+// ==================== STATS ADMIN ====================
+
 app.get('/api/admin/stats', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         const ordersSnapshot = await db.collection('orders').get();
         let revenue = 0;
         ordersSnapshot.forEach(doc => {
             const order = doc.data();
-            if (order.status !== 'cancelled') {
-                revenue += order.total || 0;
-            }
+            if (order.status !== 'cancelled') revenue += order.total || 0;
         });
-        
         const usersSnapshot = await db.collection('users').get();
+        const productsSnapshot = await db.collection('products').get();
         
         res.json({
             orderCount: ordersSnapshot.size,
             revenue: revenue,
-            userCount: usersSnapshot.size
+            userCount: usersSnapshot.size,
+            productCount: productsSnapshot.size
         });
     } catch (error) {
-        console.error('Erreur GET /admin/stats:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Tous les utilisateurs (admin)
+// ==================== ROUTES UTILISATEURS ====================
+
 app.get('/api/users', verifyToken, async (req, res) => {
-    if (!req.isAdmin) {
-        return res.status(403).json({ error: 'Admin requis' });
-    }
-    
+    if (!req.isAdmin) return res.status(403).json({ error: 'Admin requis' });
     try {
         const snapshot = await db.collection('users').get();
         const users = [];
         snapshot.forEach(doc => {
             const data = doc.data();
-            users.push({ 
-                id: doc.id, 
-                ...data,
-                createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
-            });
+            users.push({ id: doc.id, ...data, createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null });
         });
         res.json(users);
     } catch (error) {
-        console.error('Erreur GET /users:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Mes infos utilisateur
 app.get('/api/users/me', verifyToken, async (req, res) => {
     try {
         const doc = await db.collection('users').doc(req.user.uid).get();
-        if (!doc.exists) {
-            return res.status(404).json({ error: 'Utilisateur non trouvé' });
-        }
+        if (!doc.exists) return res.status(404).json({ error: 'Utilisateur non trouvé' });
         const data = doc.data();
-        res.json({ 
-            id: doc.id, 
-            ...data,
-            createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
-        });
+        res.json({ id: doc.id, ...data, createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null });
     } catch (error) {
-        console.error('Erreur GET /users/me:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Créer un utilisateur
 app.post('/api/users', verifyToken, async (req, res) => {
     try {
-        if (req.body.uid !== req.user.uid) {
-            return res.status(403).json({ error: 'UID invalide' });
-        }
-        
+        if (req.body.uid !== req.user.uid) return res.status(403).json({ error: 'UID invalide' });
+        const existingUser = await db.collection('users').doc(req.body.uid).get();
+        if (existingUser.exists) return res.json({ success: true });
         await db.collection('users').doc(req.body.uid).set({
-            name: req.body.name,
-            email: req.body.email,
-            phone: req.body.phone,
-            role: 'client',
+            name: req.body.name, email: req.body.email, phone: req.body.phone,
+            emailVerified: req.body.emailVerified || false, role: 'client',
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
     } catch (error) {
-        console.error('Erreur POST /users:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Démarrer le serveur
+// Santé
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`🚀 Serveur démarré sur http://localhost:${PORT}`);
+    console.log(`🚀 Serveur GoHBITO démarré sur port ${PORT}`);
 });
